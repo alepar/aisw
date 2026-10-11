@@ -109,6 +109,31 @@ through each step.
 Per-tool storage, state modes and limits are in
 [Supported tools](https://aiswitcher.dev/docs/supported-tools/).
 
+### macOS Claude Keychain compatibility
+
+Claude credential writes use Apple's signed `/usr/bin/security`, with exact
+credential bytes sent through a private stdin pipe instead of process arguments.
+This keeps the writer's partition compatible with Claude's Keychain reader across
+AISW rebuilds and updates. New entries trust that reader and detected Claude
+executables. Updating an existing entry retains its application approval list;
+macOS still regenerates partition/integrity ACLs when password data changes.
+
+Existing entries with restrictive permissions, or a locked/missing Keychain,
+can still require macOS authorization. This fix does not reset Keychains, change
+the default/search list, or grant unrestricted application access. Credential
+framing and nested-hex normalization fixes from upstream are included as well.
+
+The interactive Security tool accepts at most 4095 bytes per complete command
+and 32 arguments. AISW rejects oversized commands before writing (hex encoding
+roughly halves the available secret size; metadata and paths count too), rather
+than truncating credentials or putting them in argv. Child error output is kept
+private because it can echo the command. Regression tests exercise real creation
+and repeated updates in a disposable partition-enabled Keychain, checking exact
+bytes, retained reader approvals and unchanged default/search selection.
+
+Apple sources: [partition rebuilding](https://github.com/apple-oss-distributions/Security/blob/main/OSX/libsecurity_keychain/lib/Item.cpp#L845),
+[Security tool parser and limits](https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/security.c#L73).
+
 ## How it works
 
 - Profiles live under `~/.aisw/`, with secrets in the OS keyring (Keychain, Secret
