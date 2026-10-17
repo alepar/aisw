@@ -50,7 +50,7 @@ aisw uninstall [--dry-run] [--remove-data] [--yes]
 aisw shell-hook <bash|zsh|fish|pwsh>
 aisw doctor [--json]
 aisw verify [--json]
-aisw repair [--json] [--dry-run|--apply] [--fix home,permissions]
+aisw repair [--json] [--dry-run|--apply] [--fix home,permissions,claude-keychain]
 aisw project-bindings list [--json]
 ```
 
@@ -686,7 +686,7 @@ aisw verify --json
 ## `aisw repair`
 
 ```text
-aisw repair [--json] [--dry-run|--apply] [--fix home,permissions]
+aisw repair [--json] [--dry-run|--apply] [--fix home,permissions,claude-keychain]
 ```
 
 Preview or apply safe local repairs for aisw-managed state.
@@ -704,13 +704,30 @@ Preview or apply safe local repairs for aisw-managed state.
 Notes:
 - If neither `--dry-run` nor `--apply` is provided, `repair` defaults to dry-run mode.
 - `repair` is explicit and cautious. It does not reapply live credentials, restore backups, or modify shell rc files.
-- `--fix` defaults to all currently safe repair categories.
+- `--fix` defaults to `home,permissions`.
+- `--fix claude-keychain` explicitly repairs Claude OAuth profiles whose AISW
+  credential file is missing but whose native macOS profile-scoped Keychain
+  entry remains. Preview lists candidate profiles without reading tokens. Apply
+  copies each exact scoped entry into AISW's existing system-keyring backend,
+  verifies it, then updates that profile's backend metadata. Claude's native
+  entry stays untouched; no plaintext credential file is created. Keyring-backed
+  backups and ordinary profile lifecycle commands continue to use the supported
+  secure backend. This category is never selected implicitly.
+- Recovery requires a known scoped macOS scheme and local account metadata.
+  Recognized account identity contradictions, invalid token payloads and
+  different pre-existing AISW secure credentials stop that profile's repair.
+  Opaque tokens are associated by the exact canonical profile-directory service;
+  no online identity request or default-account fallback is performed.
+  Repairs commit per profile; a later profile failure preserves earlier completed
+  repairs. A repeated apply skips profiles already using the secure backend.
 
 ```sh
 aisw repair
 aisw repair --json --dry-run
 aisw repair --apply --fix home
 aisw repair --json --apply --fix home,permissions
+aisw repair --fix claude-keychain
+aisw repair --fix claude-keychain --apply
 ```
 
 ---

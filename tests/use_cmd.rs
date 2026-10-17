@@ -15,6 +15,274 @@ const ANTIGRAVITY_SECRET_WORK: &str = r#"{"email":"work@example.com","token":"wo
 const ANTIGRAVITY_SECRET_PERSONAL: &str =
     r#"{"email":"personal@example.com","token":"personal-live"}"#;
 
+fn native_only_claude_fixture() -> TestEnv {
+    use sha2::{Digest, Sha256};
+    let env = TestEnv::new();
+    env.add_fake_tool("claude", "claude 2.3.0");
+    let mut profiles = serde_json::Map::new();
+    for name in ["first", "second"] {
+        let dir = env.aisw_home.join("profiles/claude").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("oauth-account.json"),
+            format!(r#"{{"emailAddress":"{name}@example.invalid"}}"#),
+        )
+        .unwrap();
+        let service = format!(
+            "Claude Code-credentials-{:x}",
+            Sha256::digest(dir.canonicalize().unwrap().to_str().unwrap().as_bytes())
+        );
+        let item = env
+            .fake_home
+            .join("keychain")
+            .join(&service[..32])
+            .join("tester");
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::write(item.join("account"), "tester").unwrap();
+        std::fs::write(item.join("secret"), format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"fixture-{name}","refreshToken":"refresh-{name}","expiresAt":9999999999999}},"account":{{"email":"{name}@example.invalid"}}}}"#)).unwrap();
+        profiles.insert(name.into(), serde_json::json!({"added_at":"2026-10-17T00:00:00Z","auth_method":"o_auth","credential_backend":"file","label":null}));
+    }
+    write_config_json(
+        &env,
+        serde_json::json!({"version":1,"active":{"claude":"first","codex":null,"gemini":null},"profiles":{"claude":profiles,"codex":{},"gemini":{}},"settings":{"backup_on_switch":true,"max_backups":10,"claude":{"state_mode":"isolated"}}}),
+    );
+    env
+}
+
+fn scoped_repair_command(env: &TestEnv) -> assert_cmd::Command {
+    let mut cmd = env.cmd();
+    cmd.env("AISW_TEST_CLAUDE_PLATFORM", "macos")
+        .env("AISW_CLAUDE_KEYCHAIN_SCHEME", "scoped")
+        .env("AISW_CLAUDE_AUTH_STORAGE", "keychain")
+        .env("USER", "tester");
+    cmd
+}
+
+#[test]
+fn claude_keychain_repair_dry_run_preserves_storage() {
+    let env = native_only_claude_fixture();
+    let before = std::fs::read(env.home_file("config.json")).unwrap();
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain", "--json"])
+        .assert()
+        .success()
+        .stdout(contains("recover_claude_keychain"));
+    assert_eq!(std::fs::read(env.home_file("config.json")).unwrap(), before);
+    assert!(!env.fake_home.join("keychain/aisw").exists());
+}
+
+#[test]
+fn claude_keychain_repair_supports_switches_without_plaintext_files() {
+    let env = native_only_claude_fixture();
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain", "--apply"])
+        .assert()
+        .success();
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.home_file("config.json")).unwrap()).unwrap();
+    for name in ["first", "second"] {
+        assert_eq!(
+            config["profiles"]["claude"][name]["credential_backend"],
+            "system_keyring"
+        );
+        let managed = env
+            .fake_home
+            .join("keychain/aisw")
+            .join(format!("profile:claude:{name}/secret"));
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(managed).unwrap()).unwrap();
+        assert_eq!(
+            data["claudeAiOauth"]["accessToken"],
+            format!("fixture-{name}")
+        );
+        scoped_repair_command(&env)
+            .args(["use", "claude", name, "--emit-env"])
+            .assert()
+            .success();
+        scoped_repair_command(&env)
+            .env(
+                "CLAUDE_CONFIG_DIR",
+                env.home_file(&format!("profiles/claude/{name}")),
+            )
+            .args(["use", "claude", name, "--json"])
+            .assert()
+            .success();
+        assert!(!env
+            .home_file(&format!("profiles/claude/{name}/.credentials.json"))
+            .exists());
+    }
+    assert!(!env.fake_home.join(".claude/.credentials.json").exists());
+    // Secure backup snapshots must stay in the keyring as well.
+    assert!(std::fs::read_dir(env.fake_home.join("keychain/aisw"))
+        .unwrap()
+        .any(|item| item
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("backup:")));
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain", "--apply", "--json"])
+        .assert()
+        .success()
+        .stdout(contains("\"actions_applied\": 0"));
+}
+
+#[test]
+fn claude_keychain_repair_refuses_shared_or_unknown_scheme() {
+    for scheme in ["shared", "unknown"] {
+        let env = native_only_claude_fixture();
+        let before = std::fs::read(env.home_file("config.json")).unwrap();
+        scoped_repair_command(&env)
+            .env("AISW_CLAUDE_KEYCHAIN_SCHEME", scheme)
+            .args(["repair", "--fix", "claude-keychain", "--apply"])
+            .assert()
+            .failure();
+        assert_eq!(std::fs::read(env.home_file("config.json")).unwrap(), before);
+        assert!(!env.fake_home.join("keychain/aisw").exists());
+    }
+}
+
+#[test]
+fn claude_keychain_repair_refuses_invalid_or_wrong_account_payloads() {
+    use sha2::{Digest, Sha256};
+    for payload in [
+        r#"{"account":{"email":"first@example.invalid"}}"#,
+        r#"{"claudeAiOauth":{"accessToken":"fixture","refreshToken":"refresh"},"account":{"email":"wrong@example.invalid"}}"#,
+        r#"{"claudeAiOauth":{"accessToken":"fixture","refreshToken":"refresh"},"account":{"emailAddress":"wrong@example.invalid"}}"#,
+        r#"{"claudeAiOauth":{"accessToken":"fixture","refreshToken":"refresh"},"account":{"email_address":"wrong@example.invalid"}}"#,
+        r#"{"claudeAiOauth":{"accessToken":"fixture","refreshToken":"refresh"},"account":{"mail":"wrong@example.invalid"}}"#,
+        r#"{"apiKey":"fixture-api-key","claudeAiOauth":{"accessToken":"fixture","refreshToken":"refresh"}}"#,
+    ] {
+        let env = native_only_claude_fixture();
+        let dir = env.home_file("profiles/claude/first");
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(dir.canonicalize().unwrap().to_str().unwrap().as_bytes())
+        );
+        let secret = env
+            .fake_home
+            .join("keychain")
+            .join(format!("Claude Code-credentials-{}", &hash[..8]))
+            .join("tester/secret");
+        std::fs::write(&secret, payload).unwrap();
+        let before = std::fs::read(env.home_file("config.json")).unwrap();
+        let output = scoped_repair_command(&env)
+            .args(["repair", "--fix", "claude-keychain", "--apply"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_output_redacts_secret(&output, "fixture-api-key");
+        assert_eq!(std::fs::read(env.home_file("config.json")).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(secret).unwrap(), payload);
+        assert!(!env.fake_home.join("keychain/aisw").exists());
+    }
+}
+
+#[test]
+fn claude_keychain_repair_never_uses_default_account_or_overwrites_managed_secret() {
+    for existing in [false, true] {
+        let env = native_only_claude_fixture();
+        let before = std::fs::read(env.home_file("config.json")).unwrap();
+        let item = if existing {
+            env.fake_home.join("keychain/aisw/profile:claude:first")
+        } else {
+            // Remove only the scoped items and offer a valid shared item.
+            std::fs::remove_dir_all(env.fake_home.join("keychain")).unwrap();
+            env.fake_home
+                .join("keychain/Claude Code-credentials/tester")
+        };
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::write(
+            item.join("account"),
+            if existing {
+                "profile:claude:first"
+            } else {
+                "tester"
+            },
+        )
+        .unwrap();
+        let sentinel =
+            r#"{"claudeAiOauth":{"accessToken":"unrelated-secret","refreshToken":"refresh"}}"#;
+        std::fs::write(item.join("secret"), sentinel).unwrap();
+        let output = scoped_repair_command(&env)
+            .args(["repair", "--fix", "claude-keychain", "--apply"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_output_redacts_secret(&output, "unrelated-secret");
+        assert_eq!(std::fs::read(env.home_file("config.json")).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(item.join("secret")).unwrap(),
+            sentinel
+        );
+    }
+}
+
+#[test]
+fn claude_keychain_repair_does_not_migrate_api_keys_or_existing_files() {
+    let env = native_only_claude_fixture();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.home_file("config.json")).unwrap()).unwrap();
+    config["profiles"]["claude"]["first"]["auth_method"] = "api_key".into();
+    write_config_json(&env, config);
+    let secret = env.home_file("profiles/claude/second/.credentials.json");
+    std::fs::write(&secret, b"existing-file").unwrap();
+    let before = std::fs::read(env.home_file("config.json")).unwrap();
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain", "--apply", "--json"])
+        .assert()
+        .success()
+        .stdout(contains("\"actions_applied\": 0"));
+    assert_eq!(std::fs::read(env.home_file("config.json")).unwrap(), before);
+    assert_eq!(std::fs::read(secret).unwrap(), b"existing-file");
+    assert!(!env.fake_home.join("keychain/aisw").exists());
+}
+
+#[test]
+fn claude_keychain_repair_dry_run_does_not_create_a_missing_config() {
+    let env = TestEnv::new();
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain", "--json"])
+        .assert()
+        .success();
+    assert!(!env.home_file("config.json").exists());
+    assert!(!env.home_file("config.json.lock").exists());
+}
+
+#[test]
+fn claude_keychain_repair_rolls_back_new_secure_copy_on_config_failure() {
+    let env = native_only_claude_fixture();
+    let before = std::fs::read(env.home_file("config.json")).unwrap();
+    // Reading the existing config succeeds, but acquiring its mutation lock
+    // fails after recovery has staged and verified the secure credential.
+    std::fs::create_dir(env.home_file("config.json.lock")).unwrap();
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain", "--apply"])
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(env.home_file("config.json")).unwrap(), before);
+    assert!(!env
+        .fake_home
+        .join("keychain/aisw/profile:claude:first")
+        .exists());
+    assert!(!env
+        .home_file("profiles/claude/first/.credentials.json")
+        .exists());
+}
+
+#[test]
+fn claude_keychain_repair_dry_run_refuses_a_missing_profile_directory() {
+    let env = native_only_claude_fixture();
+    std::fs::remove_dir_all(env.home_file("profiles/claude/first")).unwrap();
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain"])
+        .assert()
+        .failure()
+        .stderr(contains("profile directory is missing"));
+    assert!(!env.fake_home.join("keychain/aisw").exists());
+}
+
 fn add_claude_profile(env: &TestEnv, name: &str) {
     env.add_fake_tool("claude", "claude 2.3.0");
     env.cmd()

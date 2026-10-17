@@ -79,7 +79,7 @@ pub(super) fn forced_auth_storage() -> Option<ClaudeAuthStorage> {
     }
 }
 
-fn shared_keychain_platform() -> bool {
+pub(super) fn shared_keychain_platform() -> bool {
     cfg!(target_os = "macos")
         || matches!(
             super::super::test_overrides::string("AISW_TEST_CLAUDE_PLATFORM").as_deref(),

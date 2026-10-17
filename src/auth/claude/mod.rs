@@ -311,6 +311,120 @@ pub(super) fn read_stored_credentials(
     .map(|bytes| normalize_credentials_bytes(&bytes).unwrap_or(bytes))
 }
 
+/// Explicitly repair a native-only OAuth profile using AISW's existing secure
+/// backend. The caller holds the switch lock; no live Claude item is written.
+pub fn recover_scoped_keychain_storage(home: &Path, name: &str, user_home: &Path) -> Result<()> {
+    use crate::config::{AuthMethod, ConfigStore};
+    use anyhow::{bail, ensure};
+
+    let config_store = ConfigStore::new(home);
+    let config = config_store.load()?;
+    let mut meta = config
+        .profiles_for(Tool::Claude)
+        .get(name)
+        .context("Claude profile is not registered")?
+        .clone();
+    ensure!(
+        meta.auth_method == AuthMethod::OAuth && meta.credential_backend == CredentialBackend::File,
+        "only missing file-backed Claude OAuth profiles can be recovered"
+    );
+    ensure!(
+        keychain::shared_keychain_platform()
+            && keychain::forced_auth_storage() != Some(ClaudeAuthStorage::File)
+            && current_keychain_scheme() == KeychainScheme::ScopedByConfigDir,
+        "recovery requires Claude's profile-scoped macOS Keychain scheme"
+    );
+    let profiles = ProfileStore::new(home);
+    let dir = profiles.validated_profile_dir(Tool::Claude, name)?;
+    ensure!(dir.is_dir(), "Claude profile directory is missing");
+    match profiles.read_file(Tool::Claude, name, CREDENTIALS_FILE) {
+        Ok(_) => bail!("Claude credential file already exists; no recovery needed"),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let account: serde_json::Value =
+        serde_json::from_slice(&profiles.read_file(Tool::Claude, name, OAUTH_ACCOUNT_FILE)?)
+            .context("Claude account metadata is invalid")?;
+    ensure!(
+        nonempty_string(account.get("emailAddress")) || nonempty_string(account.get("accountUuid")),
+        "Claude account metadata has no identity"
+    );
+    let service =
+        scoped_keychain_service_for_config_dir(&dir, user_home, KeychainScheme::ScopedByConfigDir);
+    ensure!(
+        service != KEYCHAIN_SERVICE,
+        "refusing recovery from the shared default Keychain entry"
+    );
+    let raw = keychain::read_keychain_credentials_for_service(&service)?
+        .context("this profile's native Claude Keychain entry is unavailable")?;
+    let bytes =
+        normalize_credentials_bytes(&raw).context("native Claude credentials are invalid")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        nonempty_string(value.pointer("/claudeAiOauth/accessToken"))
+            && nonempty_string(value.pointer("/claudeAiOauth/refreshToken"))
+            && value.get("apiKey").is_none(),
+        "native Keychain entry has no usable Claude OAuth credentials"
+    );
+    // Native tokens can be opaque and have no embedded account identity. The
+    // exact config-directory service is the binding; corroborate when present.
+    if let (Some(actual), Some(expected)) = (
+        super::identity::find_email(&value),
+        account.get("emailAddress").and_then(|v| v.as_str()),
+    ) {
+        ensure!(
+            actual.eq_ignore_ascii_case(expected),
+            "native Claude Keychain account does not match profile metadata"
+        );
+    }
+    for (field, expected) in [("uuid", "accountUuid"), ("accountUuid", "accountUuid")] {
+        if let (Some(actual), Some(want)) = (
+            value
+                .get("account")
+                .and_then(|a| a.get(field))
+                .and_then(|v| v.as_str()),
+            account.get(expected).and_then(|v| v.as_str()),
+        ) {
+            ensure!(
+                actual.eq_ignore_ascii_case(want),
+                "native Claude Keychain account does not match profile metadata"
+            );
+        }
+    }
+    let previous = secure_store::read_profile_secret(Tool::Claude, name)?;
+    if let Some(existing) = &previous {
+        ensure!(
+            normalize_credentials_bytes(existing).as_deref() == Some(bytes.as_slice()),
+            "AISW already has different secure credentials; refusing to overwrite them"
+        );
+    }
+    let result = (|| -> Result<()> {
+        if previous.is_none() {
+            secure_store::write_profile_secret(Tool::Claude, name, &bytes)?;
+        }
+        ensure!(
+            secure_store::read_profile_secret(Tool::Claude, name)?.as_deref()
+                == Some(bytes.as_slice()),
+            "could not verify recovered credentials in AISW's system keyring"
+        );
+        meta.credential_backend = CredentialBackend::SystemKeyring;
+        config_store.upsert_profile(Tool::Claude, name, meta)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if previous.is_none() {
+            secure_store::delete_profile_secret(Tool::Claude, name).context(
+                "could not roll back the recovered secure credential after config failure",
+            )?;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub(crate) fn persist_stored_credentials(
     profile_store: &ProfileStore,
     name: &str,

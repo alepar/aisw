@@ -111,6 +111,13 @@ Per-tool storage, state modes and limits are in
 
 ### macOS Claude Keychain compatibility
 
+If switching reports a missing `.credentials.json` while Claude's profile-scoped
+Keychain login still works, preview `aisw repair --fix claude-keychain`, then run
+it with `--apply`. This recovers AISW's managed copy into its existing secure
+Keychain backend and updates profile metadata. It creates no plaintext credential
+file and leaves Claude's native entry untouched. See the
+[repair command](docs/commands.md#aisw-repair) for validation and recovery limits.
+
 Claude credential writes use Apple's signed `/usr/bin/security`, with exact
 credential bytes sent through a private stdin pipe instead of process arguments.
 This keeps the writer's partition compatible with Claude's Keychain reader across

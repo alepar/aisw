@@ -173,6 +173,8 @@ pub struct VerifyArgs {
 pub enum RepairFix {
     Home,
     Permissions,
+    /// Recover native Claude OAuth credentials into AISW's secure keyring
+    ClaudeKeychain,
 }
 
 #[derive(Args, Debug)]

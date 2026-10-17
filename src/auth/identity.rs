@@ -399,7 +399,7 @@ fn resolve_identity_from_value(tool: Tool, value: &Value) -> Option<OAuthIdentit
     }
 }
 
-fn find_email(value: &Value) -> Option<String> {
+pub(super) fn find_email(value: &Value) -> Option<String> {
     walk_json(value, &|key, raw| {
         let trimmed = raw.trim();
         if matches!(

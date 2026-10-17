@@ -496,7 +496,7 @@ impl ConfigStore {
         Ok(config)
     }
 
-    fn load_existing(&self) -> Result<Config> {
+    pub(crate) fn load_existing(&self) -> Result<Config> {
         let contents = fs::read_to_string(&self.path)
             .with_context(|| format!("could not read {}", self.path.display()))?;
 

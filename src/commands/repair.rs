@@ -64,6 +64,7 @@ enum ActionKind {
     CreateConfig,
     SetDirPermissions,
     SetFilePermissions,
+    RecoverClaudeKeychain,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +139,42 @@ fn plan_actions(home: &Path, requested_fixes: &[RepairFix]) -> Result<Vec<Planne
 
     if requested_fixes.contains(&RepairFix::Permissions) && home.exists() {
         collect_permission_repairs(home, &mut actions)?;
+    }
+
+    if requested_fixes.contains(&RepairFix::ClaudeKeychain) && home.join("config.json").exists() {
+        let config = ConfigStore::new(home).load_existing()?;
+        let profiles = crate::profile::ProfileStore::new(home);
+        for (name, meta) in config.profiles_for(crate::types::Tool::Claude) {
+            if meta.auth_method != crate::config::AuthMethod::OAuth
+                || meta.credential_backend != crate::config::CredentialBackend::File
+            {
+                continue;
+            }
+            // Only absence is repairable. Do not hide symlinks, unreadable
+            // files, invalid paths or missing profile directories.
+            let dir = profiles.validated_profile_dir(crate::types::Tool::Claude, name)?;
+            anyhow::ensure!(
+                dir.is_dir(),
+                "Claude profile directory is missing: {}",
+                dir.display()
+            );
+            match fs::symlink_metadata(dir.join(".credentials.json")) {
+                Ok(meta) => anyhow::ensure!(
+                    meta.is_file() && !meta.file_type().is_symlink(),
+                    "Claude credential path is not a regular file"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    actions.push(PlannedAction {
+                        fix: RepairFix::ClaudeKeychain,
+                        kind: ActionKind::RecoverClaudeKeychain,
+                        path: dir,
+                        detail: "recover this profile's native Claude OAuth credentials into AISW's system keyring".to_owned(),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        actions.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
     Ok(actions)
@@ -235,6 +272,16 @@ fn apply_one(home: &Path, action: &PlannedAction) -> Result<()> {
         }
         ActionKind::SetFilePermissions => {
             set_file_permissions_600(&action.path)?;
+        }
+        ActionKind::RecoverClaudeKeychain => {
+            let name = action
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("invalid Claude profile name")?;
+            let user_home =
+                crate::runtime::user_home().context("could not determine home directory")?;
+            crate::auth::claude::recover_scoped_keychain_storage(home, name, &user_home)?;
         }
     }
     Ok(())
@@ -342,6 +389,7 @@ fn repair_fix_name(fix: RepairFix) -> &'static str {
     match fix {
         RepairFix::Home => "home",
         RepairFix::Permissions => "permissions",
+        RepairFix::ClaudeKeychain => "claude_keychain",
     }
 }
 
@@ -351,6 +399,7 @@ fn action_kind_name(kind: ActionKind) -> &'static str {
         ActionKind::CreateConfig => "create_config",
         ActionKind::SetDirPermissions => "set_dir_permissions",
         ActionKind::SetFilePermissions => "set_file_permissions",
+        ActionKind::RecoverClaudeKeychain => "recover_claude_keychain",
     }
 }
 
