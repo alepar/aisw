@@ -88,6 +88,25 @@ pub fn read_generic_password(service: &str, account: Option<&str>) -> Result<Opt
     Ok(Some(strip_cli_output_terminator(output.stdout)))
 }
 
+pub fn delete_generic_password(service: &str, account: &str) -> Result<()> {
+    ensure_available()?;
+    let mut command = Command::new(security_bin());
+    command.args(["delete-generic-password", "-s", service, "-a", account]);
+    if let Some(path) = override_keychain_path() {
+        command.arg(path);
+    }
+    let output = command
+        .output()
+        .context("could not delete macOS Keychain generic password")?;
+    if output.status.success() || output.status.code() == Some(44) {
+        return Ok(());
+    }
+    if is_user_canceled(&output.status, &String::from_utf8_lossy(&output.stderr)) {
+        bail!("Keychain access was denied; could not delete credentials.");
+    }
+    bail!("could not delete macOS Keychain generic password");
+}
+
 /// Removes the single trailing newline `security(1)` writes after a `-w` value.
 ///
 /// That byte is part of the CLI's output framing, not the stored secret, and it
@@ -392,6 +411,32 @@ mod tests {
         write_mock_security(&bin, "#!/bin/sh\nexit 0\n");
         let _security = EnvVarGuard::set("AISW_SECURITY_BIN", &bin);
         assert!(is_available());
+    }
+
+    #[test]
+    fn delete_targets_exact_item_without_reading_secret_and_is_idempotent() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("security");
+        let marker = dir.path().join("args");
+        let keychain = dir.path().join("isolated.keychain-db");
+        let _security = EnvVarGuard::set("AISW_SECURITY_BIN", &bin);
+        let _keychain = EnvVarGuard::set("AISW_SECURITY_KEYCHAIN", &keychain);
+        for code in [0, 44, 128, 1] {
+            write_mock_security(&bin, &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho private-output >&2\nexit {code}\n", marker.display()));
+            let result = delete_generic_password("aisw", "backup:bkp-1:claude:work");
+            assert_eq!(result.is_ok(), code == 0 || code == 44);
+            if let Err(err) = result {
+                assert!(!err.to_string().contains("private-output"));
+            }
+            assert_eq!(
+                fs::read_to_string(&marker).unwrap(),
+                format!(
+                    "delete-generic-password\n-s\naisw\n-a\nbackup:bkp-1:claude:work\n{}\n",
+                    keychain.display()
+                )
+            );
+        }
     }
 
     #[test]

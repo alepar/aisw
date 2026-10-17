@@ -131,6 +131,12 @@ pub fn delete_generic_password(service: &str, account: &str) -> Result<()> {
         return delete_fake_password(&root, service, account);
     }
 
+    // keyring's native macOS deletion reads the password first, which would
+    // reintroduce the changing-binary ACL problem during pruning/rollback.
+    if cfg!(target_os = "macos") && is_managed_claude_account(service, Some(account)) {
+        return macos_keychain::delete_generic_password(service, account);
+    }
+
     let entry = keyring::Entry::new(service, account).map_err(|err| {
         anyhow!("could not open system keyring entry for {service}/{account}: {err}")
     })?;
