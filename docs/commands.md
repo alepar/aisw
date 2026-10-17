@@ -715,6 +715,9 @@ Notes:
   secure backend. On macOS, these profiles keep applying and checking credentials
   in Keychain even when no shared/default Claude entry exists. Isolated profile
   switches also synchronize a native token refresh before applying credentials.
+  Managed Claude copies and backups use Apple's signed reader/writer as well,
+  so replacing the AISW binary does not change their accessing application's
+  signature. Existing entries can still need one approval for that signed tool.
   This category is never selected implicitly.
 - Recovery requires a known scoped macOS scheme and local account metadata.
   Recognized account identity contradictions, invalid token payloads and

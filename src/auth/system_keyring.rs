@@ -62,8 +62,17 @@ pub fn read_generic_password(service: &str, account: Option<&str>) -> Result<Opt
         return read_fake_password(&root, service, account);
     }
 
-    if cfg!(target_os = "macos") && service != "aisw" {
-        return macos_keychain::read_generic_password(service, account);
+    if cfg!(target_os = "macos")
+        && (service != "aisw" || is_managed_claude_account(service, account))
+    {
+        let bytes = macos_keychain::read_generic_password(service, account)?;
+        return Ok(bytes.map(|bytes| {
+            if is_managed_claude_account(service, account) {
+                super::claude::normalize_credentials_bytes(&bytes).unwrap_or(bytes)
+            } else {
+                bytes
+            }
+        }));
     }
 
     let Some(account) = resolve_account(service, account)? else {
@@ -87,6 +96,13 @@ pub fn upsert_generic_password(service: &str, account: &str, secret: &[u8]) -> R
         return write_fake_password(&root, service, account, secret);
     }
 
+    // Claude's managed profiles and backups need the same stable signed reader
+    // and writer as its native entries. A rebuilt aisw has a different ad-hoc
+    // signature and cannot reliably satisfy an older native keyring item's ACL.
+    if cfg!(target_os = "macos") && is_managed_claude_account(service, Some(account)) {
+        return macos_keychain::upsert_generic_password(service, account, secret, &[]);
+    }
+
     // Use the native keyring backend for writes on every platform. On macOS
     // this avoids `security add-generic-password` TTY prompts leaking into
     // normal CLI flows when aisw stores its own managed secure profiles.
@@ -97,6 +113,17 @@ pub fn upsert_generic_password(service: &str, account: &str, secret: &[u8]) -> R
     entry.set_password(secret).map_err(|err| {
         anyhow!("could not write system keyring entry for {service}/{account}: {err}")
     })
+}
+
+fn is_managed_claude_account(service: &str, account: Option<&str>) -> bool {
+    service == "aisw"
+        && account.is_some_and(|account| {
+            account.starts_with("profile:claude:")
+                || account
+                    .strip_prefix("backup:")
+                    .and_then(|rest| rest.split_once(':'))
+                    .is_some_and(|(_, rest)| rest.starts_with("claude:"))
+        })
 }
 
 pub fn delete_generic_password(service: &str, account: &str) -> Result<()> {
@@ -350,6 +377,31 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use tempfile::tempdir;
+
+    #[test]
+    fn managed_claude_routing_covers_profiles_and_backup_account_layout() {
+        assert!(is_managed_claude_account(
+            "aisw",
+            Some("profile:claude:work")
+        ));
+        assert!(is_managed_claude_account(
+            "aisw",
+            Some("backup:bkp-1:claude:work")
+        ));
+        for account in [
+            None,
+            Some("profile:codex:work"),
+            Some("profile:claude-other:work"),
+            Some("backup:bkp-1:codex:claude"),
+            Some("backup:claude:work"),
+        ] {
+            assert!(!is_managed_claude_account("aisw", account));
+        }
+        assert!(!is_managed_claude_account(
+            "another-service",
+            Some("profile:claude:work")
+        ));
+    }
 
     struct EnvVarGuard {
         key: &'static str,
