@@ -616,7 +616,7 @@ pub fn sync_profile_from_active_state_if_same_identity(
     state_mode: crate::types::StateMode,
 ) -> Result<bool> {
     let Some(snapshot) =
-        active_credentials_snapshot_for_sync(profile_store, name, user_home, state_mode)?
+        active_credentials_snapshot_for_sync(profile_store, name, backend, user_home, state_mode)?
     else {
         return Ok(false);
     };
@@ -641,13 +641,16 @@ pub fn sync_profile_from_active_state_if_same_identity(
 fn active_credentials_snapshot_for_sync(
     profile_store: &ProfileStore,
     name: &str,
+    backend: CredentialBackend,
     user_home: &Path,
     state_mode: crate::types::StateMode,
 ) -> Result<Option<LiveCredentialSnapshot>> {
     match state_mode {
         crate::types::StateMode::Shared => live_credentials_snapshot_for_import(user_home),
         crate::types::StateMode::Isolated => {
-            if !super::uses_live_keychain(user_home) {
+            if super::profile_auth_storage(user_home, backend)
+                != super::keychain::ClaudeAuthStorage::Keychain
+            {
                 return Ok(None);
             }
             let scheme = super::current_claude_keychain_scheme();

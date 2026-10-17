@@ -712,7 +712,10 @@ Notes:
   verifies it, then updates that profile's backend metadata. Claude's native
   entry stays untouched; no plaintext credential file is created. Keyring-backed
   backups and ordinary profile lifecycle commands continue to use the supported
-  secure backend. This category is never selected implicitly.
+  secure backend. On macOS, these profiles keep applying and checking credentials
+  in Keychain even when no shared/default Claude entry exists. Isolated profile
+  switches also synchronize a native token refresh before applying credentials.
+  This category is never selected implicitly.
 - Recovery requires a known scoped macOS scheme and local account metadata.
   Recognized account identity contradictions, invalid token payloads and
   different pre-existing AISW secure credentials stop that profile's repair.

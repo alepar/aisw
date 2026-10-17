@@ -163,12 +163,12 @@ pub fn classify_profile(
     profile_store: &ProfileStore,
     name: &str,
     auth_method: crate::config::AuthMethod,
-    _backend: CredentialBackend,
+    backend: CredentialBackend,
 ) -> Result<ClaudeAuthClassification> {
     Ok(match auth_method {
         crate::config::AuthMethod::ApiKey => ClaudeAuthClassification::ApiKey,
         crate::config::AuthMethod::OAuth => {
-            if uses_live_keychain(user_home) {
+            if profile_auth_storage(user_home, backend) == ClaudeAuthStorage::Keychain {
                 match current_keychain_scheme() {
                     KeychainScheme::LegacyShared => {
                         ClaudeAuthClassification::OAuthMacosKeychainSharedLive
@@ -203,6 +203,19 @@ pub fn login_targets_profile_state(user_home: &Path) -> bool {
 
 // ---- Core public functions ----
 
+// A managed Keychain profile must keep using native Keychain storage even if
+// Claude has never created a shared/default entry. Scoped entries are enough.
+fn profile_auth_storage(user_home: &Path, backend: CredentialBackend) -> ClaudeAuthStorage {
+    if backend == CredentialBackend::SystemKeyring
+        && keychain::shared_keychain_platform()
+        && keychain::forced_auth_storage() != Some(ClaudeAuthStorage::File)
+    {
+        ClaudeAuthStorage::Keychain
+    } else {
+        auth_storage(user_home)
+    }
+}
+
 pub fn apply_live_credentials(
     profile_store: &ProfileStore,
     name: &str,
@@ -212,7 +225,7 @@ pub fn apply_live_credentials(
 ) -> Result<()> {
     let stored = read_stored_credentials(profile_store, name, backend)?;
 
-    match auth_storage(user_home) {
+    match profile_auth_storage(user_home, backend) {
         ClaudeAuthStorage::File => crate::live_apply::apply_transaction(
             user_home,
             vec![crate::live_apply::LiveFileChange::write(
@@ -256,7 +269,7 @@ pub fn live_credentials_match(
     state_mode: StateMode,
 ) -> Result<bool> {
     let stored = read_stored_credentials(profile_store, name, backend)?;
-    match auth_storage(user_home) {
+    match profile_auth_storage(user_home, backend) {
         ClaudeAuthStorage::File => {
             let live_path = live_credentials_path(user_home);
             if !live_path.exists() {

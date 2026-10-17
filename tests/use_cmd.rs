@@ -97,10 +97,12 @@ fn claude_keychain_repair_supports_switches_without_plaintext_files() {
             format!("fixture-{name}")
         );
         scoped_repair_command(&env)
+            .env_remove("AISW_CLAUDE_AUTH_STORAGE")
             .args(["use", "claude", name, "--emit-env"])
             .assert()
             .success();
         scoped_repair_command(&env)
+            .env_remove("AISW_CLAUDE_AUTH_STORAGE")
             .env(
                 "CLAUDE_CONFIG_DIR",
                 env.home_file(&format!("profiles/claude/{name}")),
@@ -126,6 +128,48 @@ fn claude_keychain_repair_supports_switches_without_plaintext_files() {
         .assert()
         .success()
         .stdout(contains("\"actions_applied\": 0"));
+}
+
+#[test]
+fn repaired_keychain_profile_preserves_native_refresh_without_default_entry() {
+    use sha2::{Digest, Sha256};
+    let env = native_only_claude_fixture();
+    scoped_repair_command(&env)
+        .args(["repair", "--fix", "claude-keychain", "--apply"])
+        .assert()
+        .success();
+    let dir = env.home_file("profiles/claude/first");
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(dir.canonicalize().unwrap().to_str().unwrap().as_bytes())
+    );
+    let native = env
+        .fake_home
+        .join("keychain")
+        .join(format!("Claude Code-credentials-{}", &hash[..8]))
+        .join("tester/secret");
+    let mut latest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&native).unwrap()).unwrap();
+    latest["claudeAiOauth"]["accessToken"] = "fixture-refreshed".into();
+    std::fs::write(&native, serde_json::to_vec(&latest).unwrap()).unwrap();
+    scoped_repair_command(&env)
+        .env_remove("AISW_CLAUDE_AUTH_STORAGE")
+        .env("CLAUDE_CONFIG_DIR", &dir)
+        .args(["use", "claude", "first", "--json"])
+        .assert()
+        .success();
+    let managed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            env.fake_home
+                .join("keychain/aisw/profile:claude:first/secret"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(managed["claudeAiOauth"]["accessToken"], "fixture-refreshed");
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(native).unwrap()).unwrap();
+    assert_eq!(after, latest);
+    assert!(!dir.join(".credentials.json").exists());
 }
 
 #[test]
